@@ -6,6 +6,7 @@
 #include <TTree.h>
 #include "HelixExtrapolator.h"
 #include "HelixPropagator.h"
+#include "ShowerFitterHelper.h"
 // Add default constructor to fix std::map value type initialization
 // struct HitPoint {
 //     double theta = 0.0;
@@ -61,6 +62,7 @@ void HelixFitter(char *INFILE, char *TNAME, char *OFILE, char *ONAME) {
 
   //Reconstruction values
   double mean_ele_Lhood = -12000.0, std_ele_Lhood = 2000.0, e_score = 0.0;
+  double mean_gam_Lhood = -32.5, std_gam_Lhood = 20.0, g_score = 0.0;
   
   std::vector<double> *tht = nullptr, *phi = nullptr, *layz = nullptr;
   std::vector<double> *track_tht = nullptr, *track_phi = nullptr, *track_z = nullptr;
@@ -68,11 +70,13 @@ void HelixFitter(char *INFILE, char *TNAME, char *OFILE, char *ONAME) {
   std::vector<double> *v_beamTH = nullptr;
   std::vector<double> *v_beamPH = nullptr;
   std::vector<double> *v_beamEne = nullptr;
+  std::vector<double> *v_pdgID = nullptr;
 
   t->SetBranchAddress("TrackTht", &track_tht);
   t->SetBranchAddress("beamEnergy", &v_beamEne);
   t->SetBranchAddress("beamTH", &v_beamTH);
   t->SetBranchAddress("beamPH", &v_beamPH);
+  t->SetBranchAddress("pdgID", &v_pdgID);
   t->SetBranchAddress("TrackPhi", &track_phi);
   t->SetBranchAddress("TrackZ", &track_z);
   t->SetBranchAddress("TrackEne", &track_ene);
@@ -87,14 +91,16 @@ void HelixFitter(char *INFILE, char *TNAME, char *OFILE, char *ONAME) {
 
   std::vector<double> extr_theta, extr_phi, extr_z;
   Int_t event = 0;
-  double R,z0,phi0,dR,dz0,dphi0,p,dp,beamTH,beamPH,beamEne;
-  double MIP,dMIP,Slope,dSlope,Curv,dCurv;
+  double R,z0,phi0,dR,dz0,dphi0,p,dp,beamTH,beamPH,beamEne,pdgID;
   double eLhood_helix, eLhood_both;
+  double xinter, xinter_err, slope, slope_err, chi2;
+  double gamLhood_conv, gamLhood_ene;
   //tout->Branch("ExTheta", &extr_theta);
   //tout->Branch("ExPhi", &extr_phi);
   tout->Branch("beamEne", &beamEne);
   tout->Branch("beamTH", &beamTH);
   tout->Branch("beamPH", &beamPH);
+  tout->Branch("pdgID", &pdgID);
   //tout->Branch("ExZ", &extr_z);
   tout->Branch("Event", &event);
   //tout->Branch("R", &R);tout->Branch("dR", &dR);
@@ -104,9 +110,33 @@ void HelixFitter(char *INFILE, char *TNAME, char *OFILE, char *ONAME) {
   //tout->Branch("MIP",&MIP);tout->Branch("dMIP",&dMIP);
   //tout->Branch("Slope",&Slope);tout->Branch("dSlope",&dSlope);
   //tout->Branch("Curv",&Curv);tout->Branch("dCurv",&dCurv);
+  tout->Branch("xinter",&xinter);tout->Branch("xinter_err",&xinter_err);
+  tout->Branch("slope",&slope);tout->Branch("slope_err",&slope_err);
   tout->Branch("eLhood_helix",&eLhood_helix);
   tout->Branch("eLhood_both",&eLhood_both);
   tout->Branch("e_score",&e_score);
+  tout->Branch("gamLhood_conv",&gamLhood_conv);
+  tout->Branch("gamLhood_ene",&gamLhood_ene);
+  tout->Branch("g_score",&g_score);
+  
+  // Generate path lengths and then
+  // load in the sum of 5 electron MIP PDF
+  //
+  //
+  // *****************************************************************************
+  // *****************************************************************************
+  // ********THIS ASSUMES THE ENTIRE DATASET HAS ONE THETA VALUE , ***************
+  // ********OTHERWISE YOU NEED TO REMAKE THE SUMMED MIP PDF EACH TIME!!! ********
+  // *****************************************************************************
+  // *****************************************************************************
+  //
+  //
+  t->GetEntry(0);
+  beamTH = v_beamTH->at(0); // load one event in so we get beamTH
+  std::vector<double> path_lengths = { 300e-6 / std::cos(beamTH) , 300e-6 / std::cos(beamTH) , 300e-6 / std::cos(beamTH) , 300e-6 / std::cos(beamTH) , 300e-6 / std::cos(beamTH) }; 
+  TH1D* old = (TH1D*)gDirectory->Get("landau_sum_pdf");
+  if (old) delete old;
+  TH1D* MIP_PDF = GenerateLandauSumPDF(path_lengths);
   
   Long64_t nev = t->GetEntries();
   for (Long64_t i = 0; i < nev; ++i) {
@@ -116,22 +146,24 @@ void HelixFitter(char *INFILE, char *TNAME, char *OFILE, char *ONAME) {
     beamEne = v_beamEne->at(0);
     beamTH = v_beamTH->at(0);
     beamPH = v_beamPH->at(0);
-
+    pdgID = v_pdgID->at(0);
+    
     // Calculate energy resolution and phi at calorimeter (2.5 m)
     sigma_ene = ENERES_stoch /std::sqrt(beamEne);
     phi_cal = beamPH + (0.3 * 3.5)/(beamEne * std::sin(beamTH)) * 2.5/std::tan(beamTH); //assuming calorimeter is measured at its start of 2.5 meters
-
+    
     // Convert tracker hits to HitPoint list
     std::vector<HitPoint> hits;
-    for (size_t j = 0; j < tht->size(); ++j) {
+    for (size_t j = 0; j < track_tht->size(); ++j) {
       double zval = (*track_z)[j];
       double thtval = (*track_tht)[j];
       double phival = (*track_phi)[j];
       double eneval = (*track_ene)[j];
-      if (zval <= 10.0 || zval >= 240.0 || abs( thtval - beamTH) > 0.05 || abs( phival - beamPH ) > 0.05) continue;
+      //if (zval <= 10.0 || zval >= 245.0 || abs( thtval - beamTH) > 0.001 || abs( phival - beamPH ) > 0.001) continue;
+      if (zval <= 10.0 || zval >= 245.0 || abs( thtval - beamTH) > 0.001) continue;
       hits.emplace_back(thtval, phival, zval/100.0, eneval); //add to hitpoint object, convert to meters. 
     }
-
+    
     //Whole and/or photon compensator code
     //Here we check if there are tracker layers with no hits
     //If there are, we add a zero energy hit
@@ -158,6 +190,61 @@ void HelixFitter(char *INFILE, char *TNAME, char *OFILE, char *ONAME) {
       }
     }
 
+    // Fill new hits vector to include layer values with tracker values
+    std::vector<HitPoint> hits_lay;
+    for (const auto& hit : hits) {
+      hits_lay.emplace_back(hit.GetTheta(),hit.GetPhi(),hit.GetZ(),hit.GetEne());
+    }
+    // Layer values
+    for (size_t j = 0; j < track_tht->size(); ++j) {
+      double zval = (*track_z)[j];
+      double thtval = (*track_tht)[j];
+      double phival = (*track_phi)[j];
+      double eneval = (*track_ene)[j];
+      if (zval <= 245.0 || zval > 253.8) continue; //reject tracker layers and later calorimeter layers
+      //we only want the first 2 X0 of the calorimeter
+      //if (abs( thtval - beamTH) > 0.001 || abs( phival - beamPH ) > 0.001)
+      if (abs( thtval - beamTH) > 0.001)
+        {
+          // this layer fails the angle cut, so put zero energy
+          hits_lay.emplace_back(thtval,phival,zval/100.0,0.0);
+        }
+      else
+        {
+          hits_lay.emplace_back(thtval, phival, zval/100.0, eneval); //add to hitpoint object, convert to meters.
+        }
+    }
+
+    // Compute photon values!
+    int n_shower_vals = 3;
+    // Compute the Shower start summer (X0 of start, hit energies, integrated radiation lengths, path lengths)
+    ShowerStartSummary summary = FindShowerStartFromHits(hits_lay, n_shower_vals,beamTH);
+
+    std::cout << "*" << std::endl;
+    for(Int_t i = 0; i < summary.int_rad_vals.size(); i++)
+      {
+	std::cout << summary.energies[i] << " , " << summary.int_rad_vals[i] << " , " << summary.path_length[i] << "\n";
+      }
+    // Compute the log-likelihood of photon convertion
+    // First have to check if the convertion occurs later than 2 X0, at which point we give this a value of 0.0, or 100% chance a photon;
+    if (summary.int_rad_vals.size() < 1) gamLhood_conv = 0.0;
+    else gamLhood_conv = ComputePhotonConversionLogLikelihood(summary.int_rad_vals[0], summary.int_rad_vals_err[0]);
+
+    // Generate the MIP histogram for the potentially different path length shower start
+    TH1D* s_old = (TH1D*)gDirectory->Get("shower_sum_pdf");
+    if (s_old) delete s_old;
+    TH1D* SHOWER_MIP_PDF = GenerateShowerLandauSumPDF(summary);
+
+    // Now we can compute the individual hit and sum of hit energy likelihood , under assumption of 2 MIPs
+    gamLhood_ene = ComputeLayered2MIPEnergyLogLikelihood(summary, SHOWER_MIP_PDF, beamEne);
+
+    //Convert likelihood to gamma score under assumption that electrons have gaussian mean and spread defined above
+    g_score = 1.0 - 1.0 / (1.0 + std::exp((gamLhood_conv + gamLhood_ene - mean_gam_Lhood) / std_gam_Lhood));
+    
+    auto profile = ComputeEnergyProfileFromHits(hits_lay); // Compute energy profile
+    ShowerFitResult result = FitPhotonShowerStartWithTMinuit(profile); // Do initial shower fit
+    xinter = result.x_intercept;xinter_err = result.x_intercept_err;
+    slope = result.slope;slope_err = result.slope_err;
     
     // Apply extrapolation
     //MultipleScatteringRotationCorrection(hits);
@@ -172,13 +259,19 @@ void HelixFitter(char *INFILE, char *TNAME, char *OFILE, char *ONAME) {
 							  xy_track_size,xy_track_size);
 
     //Get LL for helix and hit energy combined
-    eLhood_both = ComputeTrackerPosAndEneLogLikelihood(hits,beamTH,beamPH,beamEne,
-							  z_cal_dist,sigma_tht,sigma_phi,
-							  sigma_ene,sigma_z_cal,sigma_z_track,
-							  xy_track_size,xy_track_size);
+    // eLhood_both = ComputeTrackerPosAndEneLogLikelihood(hits,beamTH,beamPH,beamEne,
+    // 							  z_cal_dist,sigma_tht,sigma_phi,
+    // 							  sigma_ene,sigma_z_cal,sigma_z_track,
+    // 							  xy_track_size,xy_track_size);
 
+    //Get LL for helix, hit energy and hit energy sum combined
+    eLhood_both = ComputeTrackerPosAndEneAndEneSumLogLikelihood(hits,MIP_PDF,
+								beamTH,beamPH,beamEne,
+								z_cal_dist,sigma_tht,sigma_phi,
+								sigma_ene,sigma_z_cal,sigma_z_track,
+								xy_track_size,xy_track_size);
     //Convert likelihood to electron score under assumption that electrons have gaussian mean and spread defined above
-    e_score = 1.0 / (1.0 + std::exp((eLhood_helix - mean_ele_Lhood) / std_ele_Lhood));
+    e_score = 1.0 - 1.0 / (1.0 + std::exp((eLhood_helix - mean_ele_Lhood) / std_ele_Lhood));
     event = i;
     
     tout->Fill();
