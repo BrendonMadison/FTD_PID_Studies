@@ -1,0 +1,12 @@
+11, 22.       | This is the classification target
+
+eLhood_helix: continuous.    | Continuous numerical feature
+eLhood_ene: continuous.
+eLhood_cnt: continuous.
+eLhood_tof: continuous.
+shower_ini: continuous.
+deltaR: continuous.
+cal_LR_Asym: continuous.
+cal_UD_Asym: continuous.
+UD_LL: continuous.
+LR_LL: continuous.
